@@ -1,103 +1,134 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dwmapi.h>
-#include <unordered_map>
-#include <algorithm>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "dwmapi.lib")
-
-//Non-public Win32 APIs. Credits to:
-//https://github.com/ysc3839/win32-darkmode/blob/master/win32-darkmode/DarkMode.h
-//https://gist.github.com/rounk-ctrl/b04e5622e30e0d62956870d5c22b7017
-//https://github.com/notepad-plus-plus/notepad-plus-plus/labels/dark%20mode
-
-enum WINDOWCOMPOSITIONATTRIB
-{
-    WCA_UNDEFINED = 0,
-    WCA_USEDARKMODECOLORS = 26,
-};
-
-struct WINDOWCOMPOSITIONATTRIBDATA
-{
-    WINDOWCOMPOSITIONATTRIB Attrib;
-    PVOID pvData;
-    SIZE_T cbData;
-};
-
-#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
-#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
 
-using fnSetWindowCompositionAttribute = BOOL(WINAPI*)(HWND hWnd, WINDOWCOMPOSITIONATTRIBDATA*);
-fnSetWindowCompositionAttribute _SetWindowCompositionAttribute = nullptr;
+namespace
+{
+constexpr DWORD DarkModeAttribute = 20;
+constexpr wchar_t ThemesKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes";
+constexpr wchar_t PersonalizeKey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 
-bool _isLight = false;
-bool _mark = false;
-std::unordered_map<HWND, bool> _titles;
+bool lightTheme = true;
+bool watchingTheme = false;
 
-bool isLightTheme() {
+bool ReadLightTheme(bool previous)
+{
     DWORD value = 0;
-    DWORD cbData = static_cast<DWORD>(sizeof(value));
-    auto res = RegGetValueW(
-        HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
-        L"AppsUseLightTheme",
-        RRF_RT_REG_DWORD, NULL, &value, &cbData
-    );
-    if (res != ERROR_SUCCESS) {
-        return true;
-    }
-    return value == 1;
+    DWORD size = sizeof(value);
+    const LSTATUS status = RegGetValueW(
+        HKEY_CURRENT_USER, PersonalizeKey, L"AppsUseLightTheme",
+        RRF_RT_REG_DWORD, nullptr, &value, &size);
+    if (status == ERROR_SUCCESS)
+        return value != 0;
+    return status == ERROR_FILE_NOT_FOUND ? true : previous;
 }
 
-int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR    lpCmdLine,
-    _In_ int       nCmdShow)
+void ApplyTheme(HWND window)
 {
-    UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
+    const BOOL dark = !lightTheme;
+    DwmSetWindowAttribute(window, DarkModeAttribute, &dark, sizeof(dark));
+}
 
-    HMODULE hUser32 = GetModuleHandle(L"user32.dll");
-    if (!hUser32)
-        return 1;
-    _SetWindowCompositionAttribute = reinterpret_cast<fnSetWindowCompositionAttribute>(GetProcAddress(hUser32, "SetWindowCompositionAttribute"));
-    if (!_SetWindowCompositionAttribute)
-        return 2;
+BOOL CALLBACK ApplyToExistingWindow(HWND window, LPARAM)
+{
+    ApplyTheme(window);
+    return TRUE;
+}
 
-    BOOL dark = TRUE;
-    WINDOWCOMPOSITIONATTRIBDATA data = { WCA_USEDARKMODECOLORS, &dark, sizeof(dark) };
+void RefreshTheme()
+{
+    const bool current = ReadLightTheme(lightTheme);
+    if (current != lightTheme)
+    {
+        lightTheme = current;
+        EnumWindows(ApplyToExistingWindow, 0);
+    }
+}
+
+void CALLBACK OnWindowShown(HWINEVENTHOOK, DWORD, HWND window, LONG object, LONG child,
+                            DWORD, DWORD)
+{
+    if (!window || object != OBJID_WINDOW || child != CHILDID_SELF ||
+        GetAncestor(window, GA_ROOT) != window || !IsWindowVisible(window))
+        return;
+
+    if (!watchingTheme)
+        RefreshTheme();
+    ApplyTheme(window);
+}
+
+bool ArmThemeNotification(HKEY& key, HANDLE changed)
+{
+    if (!key && RegOpenKeyExW(HKEY_CURRENT_USER, ThemesKey, 0, KEY_NOTIFY, &key) != ERROR_SUCCESS)
+        return false;
+
+    // Watch the parent so replacing the Personalize key also produces a notification.
+    if (RegNotifyChangeKeyValue(key, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET,
+                               changed, TRUE) == ERROR_SUCCESS)
+        return true;
+
+    RegCloseKey(key);
+    key = nullptr;
+    return false;
+}
+}
+
+int APIENTRY wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
+{
     SetPriorityClass(GetCurrentProcess(), BELOW_NORMAL_PRIORITY_CLASS);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
-    WNDENUMPROC proc = [](HWND hWnd, LPARAM lParam)
-    {
-        BOOL val = !_isLight;
-        if (_titles.find(hWnd) == _titles.cend())
-            DwmSetWindowAttribute(hWnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &val, sizeof(val));
-        _titles[hWnd] = _mark;
-        return TRUE;
-    };
 
-    _isLight = isLightTheme();
-    while (true)
-    {
-        EnumWindows(proc, (LPARAM)&data);
+    const HWINEVENTHOOK hook = SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_SHOW, nullptr,
+                                             OnWindowShown, 0, 0,
+                                             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    if (!hook)
+        return 1;
 
-        for (auto it = _titles.begin(); it != _titles.end();)
+    const HANDLE changed = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    HKEY key = nullptr;
+    watchingTheme = changed && ArmThemeNotification(key, changed);
+    lightTheme = ReadLightTheme(lightTheme);
+    EnumWindows(ApplyToExistingWindow, 0);
+
+    int exitCode = 0;
+    for (;;)
+    {
+        const DWORD handleCount = watchingTheme ? 1 : 0;
+        const DWORD result = MsgWaitForMultipleObjectsEx(
+            handleCount, watchingTheme ? &changed : nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (watchingTheme && result == WAIT_OBJECT_0)
         {
-            if (it->second != _mark)
-                it = _titles.erase(it);
-            else
-                ++it;
+            watchingTheme = ArmThemeNotification(key, changed);
+            RefreshTheme();
         }
-        Sleep(75);
-        _mark = !_mark;
-        bool status = isLightTheme();
-        if (status != _isLight)
+        else if (result == WAIT_OBJECT_0 + handleCount)
         {
-            _isLight = status;
-            _titles.clear();
+            MSG message;
+            if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE))
+            {
+                if (message.message == WM_QUIT)
+                {
+                    exitCode = static_cast<int>(message.wParam);
+                    break;
+                }
+                DispatchMessageW(&message);
+            }
+        }
+        else
+        {
+            exitCode = 2;
+            break;
         }
     }
-    return 0;
+
+    UnhookWinEvent(hook);
+    if (key)
+        RegCloseKey(key);
+    if (changed)
+        CloseHandle(changed);
+    return exitCode;
 }
